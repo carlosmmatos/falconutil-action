@@ -4,6 +4,9 @@ name: platform-matrix
 
 on:
   workflow_dispatch:
+  # workflow_dispatch only works from the default branch, so also run on pushes to the test branch
+  push:
+    branches: [test/multi-arch-platform]
 
 permissions:
   contents: read
