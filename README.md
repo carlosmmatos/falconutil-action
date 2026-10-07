@@ -61,6 +61,14 @@ The action then:
 
 To read image manifests, the action uses `docker buildx imagetools` when available and falls back to `docker manifest inspect`. Detecting the platform of a source image that is not present on the runner requires access to its registry, so log in to that registry before running the action.
 
+falconutil builds the patched image for the target platform, so patching for a platform other than the runner's requires emulation on the runner. GitHub-hosted runners don't have it by default; set it up before this action:
+
+```yaml
+- uses: docker/setup-qemu-action@v3
+```
+
+Without emulation, the action fails before patching with an error that explains this.
+
 ## Usage
 
 To use this action in your workflow, add the following step:

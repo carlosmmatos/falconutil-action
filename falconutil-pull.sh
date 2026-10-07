@@ -221,6 +221,22 @@ resolve_falcon_image() {
     esac
 }
 
+# falconutil builds the patched image with RUN steps for the target platform, so the Docker
+# host must be able to run its binaries. Without emulation that fails deep in the build.
+check_target_emulation() {
+    local falcon_image="$1" daemon_arch output
+
+    daemon_arch=$(docker version --format '{{.Server.Arch}}')
+    [[ "$daemon_arch" == "$TARGET_ARCH" ]] && return
+
+    if ! output=$(docker run --rm --platform "$TARGET_PLATFORM" --entrypoint /bin/sh "$falcon_image" -c true 2>&1); then
+        if grep -q "exec format error" <<<"$output"; then
+            die "The Docker host is linux/${daemon_arch} and can't run ${TARGET_PLATFORM} binaries, which falconutil needs to build the patched image. Set up emulation before this action, for example with docker/setup-qemu-action."
+        fi
+        log "Unable to check ${TARGET_PLATFORM} emulation on the Docker host: $output" "WARNING"
+    fi
+}
+
 # Pulls the Falcon Container Sensor image for a sensor platform and prints its name
 pull_falcon_image() {
     local sensor_platform="$1"
@@ -288,6 +304,8 @@ log "Falcon Container Sensor image for ${TARGET_PLATFORM}: $falcon_image_uri"
 
 source_image_uri=$(resolve_source_image "$INPUT_SOURCE_IMAGE_URI") || exit 1
 log "Source image for ${TARGET_PLATFORM}: $source_image_uri"
+
+check_target_emulation "$falcon_image_uri"
 
 {
     # Set the bin path as an output
