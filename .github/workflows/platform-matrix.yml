@@ -36,7 +36,7 @@ jobs:
 
   patch:
     needs: sources
-    name: ${{ matrix.impl }} ${{ matrix.runner }} src=${{ matrix.source }} platform=${{ matrix.platform || 'auto' }} ${{ matrix.policy }} falcon=${{ matrix.falcon }}
+    name: ${{ matrix.impl }} ${{ matrix.runner }} src=${{ matrix.source }} platform=${{ matrix.platform || 'auto' }} ${{ matrix.policy }} falcon=${{ matrix.falcon }} qemu=${{ matrix.qemu }}
     runs-on: ${{ matrix.runner }}
     # main is the baseline: report its result without failing the run
     continue-on-error: ${{ matrix.impl == 'main' }}
@@ -49,6 +49,11 @@ jobs:
         platform: ['', x86_64, aarch64]
         policy: [Always, IfNotPresent]
         falcon: [pulled]
+        qemu: [none, setup]
+        exclude:
+          # main without emulation was already measured in the first run
+          - impl: main
+            qemu: none
         # A different falcon value makes these new combinations instead of merging them
         include:
           - impl: fix
@@ -57,6 +62,15 @@ jobs:
             platform: ''
             policy: Always
             falcon: user-uri
+            qemu: none
+            falcon_uri: registry.crowdstrike.com/falcon-container/release/falcon-container:8.11.0-8103
+          - impl: fix
+            runner: ubuntu-24.04-arm
+            source: amd64
+            platform: ''
+            policy: Always
+            falcon: user-uri
+            qemu: setup
             falcon_uri: registry.crowdstrike.com/falcon-container/release/falcon-container:8.11.0-8103
           - impl: main
             runner: ubuntu-24.04-arm
@@ -64,9 +78,14 @@ jobs:
             platform: ''
             policy: Always
             falcon: user-uri
+            qemu: setup
             falcon_uri: registry.crowdstrike.com/falcon-container/release/falcon-container:8.11.0-8103
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: matrix.qemu == 'setup'
+        uses: docker/setup-qemu-action@v3
 
       - name: Runner details
         run: |
@@ -146,6 +165,8 @@ jobs:
             *) if [[ "$SOURCE" == multi ]]; then target=$runner_arch; else target=$SOURCE; fi ;;
           esac
           if [[ "$SOURCE" == multi || "$SOURCE" == "$target" ]]; then expected=success; else expected=failure; fi
+          # falconutil builds for the target platform, which needs emulation on a different runner
+          if [[ "$target" != "$runner_arch" && "${{ matrix.qemu }}" != setup ]]; then expected=failure; fi
 
           binary=none
           if [[ -f /opt/crowdstrike/bin/falconutil ]]; then
@@ -159,7 +180,7 @@ jobs:
           [[ "$OUTCOME" == "$expected" ]] || correct=false
           if [[ "$OUTCOME" == success && "$patched" != "linux/$target" ]]; then correct=false; fi
 
-          line="| ${{ matrix.impl }} | ${runner_arch} | ${SOURCE} | ${PLATFORM:-auto} | ${{ matrix.policy }} | ${{ matrix.falcon }} | expected ${expected} | got ${OUTCOME} | patched ${patched} | falconutil ${binary} | ${correct} |"
+          line="| ${{ matrix.impl }} | ${runner_arch} | ${SOURCE} | ${PLATFORM:-auto} | ${{ matrix.policy }} | ${{ matrix.falcon }} | qemu ${{ matrix.qemu }} | expected ${expected} | got ${OUTCOME} | patched ${patched} | falconutil ${binary} | ${correct} |"
           echo "$line"
           echo "$line" >> "$GITHUB_STEP_SUMMARY"
           [[ "$correct" == true ]]
