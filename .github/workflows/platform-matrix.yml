@@ -1,0 +1,162 @@
+# Test-only workflow for the fork: runs the action on GitHub-hosted amd64 and arm64 runners
+# against amd64, arm64 and multi-arch source images, and compares it with main.
+name: platform-matrix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SRC_REPO: ghcr.io/${{ github.repository_owner }}/falconutil-action-test
+  FALCON_REGION: us-2
+
+jobs:
+  sources:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push test source images
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx create --use --driver docker-container
+          tag="${SRC_REPO}:${{ github.run_id }}"
+          docker buildx build --platform linux/amd64 -t "${tag}-amd64" --push .github/test-image
+          docker buildx build --platform linux/arm64 -t "${tag}-arm64" --push .github/test-image
+          docker buildx build --platform linux/amd64,linux/arm64 -t "${tag}-multi" --push .github/test-image
+          for s in amd64 arm64 multi; do docker buildx imagetools inspect "${tag}-${s}"; done
+
+  patch:
+    needs: sources
+    name: ${{ matrix.impl }} ${{ matrix.runner }} src=${{ matrix.source }} platform=${{ matrix.platform || 'auto' }} ${{ matrix.policy }} falcon=${{ matrix.falcon }}
+    runs-on: ${{ matrix.runner }}
+    # main is the baseline: report its result without failing the run
+    continue-on-error: ${{ matrix.impl == 'main' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        impl: [fix, main]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        source: [amd64, arm64, multi]
+        platform: ['', x86_64, aarch64]
+        policy: [Always, IfNotPresent]
+        falcon: [pulled]
+        # A different falcon value makes these new combinations instead of merging them
+        include:
+          - impl: fix
+            runner: ubuntu-24.04-arm
+            source: amd64
+            platform: ''
+            policy: Always
+            falcon: user-uri
+            falcon_uri: registry.crowdstrike.com/falcon-container/release/falcon-container:8.11.0-8103
+          - impl: main
+            runner: ubuntu-24.04-arm
+            source: amd64
+            platform: ''
+            policy: Always
+            falcon: user-uri
+            falcon_uri: registry.crowdstrike.com/falcon-container/release/falcon-container:8.11.0-8103
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner details
+        run: |
+          echo "uname -m: $(uname -m)"
+          docker version --format 'docker client {{.Client.Version}} server {{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}'
+          docker info 2>/dev/null | grep -i -E 'storage driver|driver-type' || true
+          echo "binfmt_misc: $(find /proc/sys/fs/binfmt_misc/ -mindepth 1 -printf '%f ' 2>/dev/null)"
+          docker buildx version || echo "no buildx"
+
+      - name: Log in to GHCR and get the CID
+        id: setup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FALCON_CLIENT_ID: ${{ secrets.FALCON_CLIENT_ID }}
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          api=https://api.us-2.crowdstrike.com
+          token=$(curl -s -X POST "$api/oauth2/token" -d "client_id=$FALCON_CLIENT_ID" --data-urlencode "client_secret=$FALCON_CLIENT_SECRET" | jq -r .access_token)
+          cid=$(curl -s -H "Authorization: Bearer $token" "$api/sensors/queries/installers/ccid/v1" | jq -r '.resources[0]')
+          echo "::add-mask::$cid"
+          echo "cid=$cid" >> "$GITHUB_OUTPUT"
+          echo "source=${SRC_REPO}:${{ github.run_id }}-${{ matrix.source }}" >> "$GITHUB_OUTPUT"
+
+      - name: Pre-pull source image (IfNotPresent)
+        if: matrix.policy == 'IfNotPresent'
+        run: |
+          case "${{ matrix.source }}" in
+            multi) docker pull "${{ steps.setup.outputs.source }}" ;;
+            *) docker pull --platform "linux/${{ matrix.source }}" "${{ steps.setup.outputs.source }}" ;;
+          esac
+
+      - name: Patch (fix)
+        id: patch-fix
+        if: matrix.impl == 'fix'
+        continue-on-error: true
+        uses: ./
+        with:
+          falcon_client_id: ${{ secrets.FALCON_CLIENT_ID }}
+          falcon_region: ${{ env.FALCON_REGION }}
+          cid: ${{ steps.setup.outputs.cid }}
+          source_image_uri: ${{ steps.setup.outputs.source }}
+          target_image_uri: local/patched:test
+          falcon_image_platform: ${{ matrix.platform }}
+          falcon_image_uri: ${{ matrix.falcon_uri }}
+          image_pull_policy: ${{ matrix.policy }}
+        env:
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+
+      - name: Patch (main)
+        id: patch-main
+        if: matrix.impl == 'main'
+        continue-on-error: true
+        uses: CrowdStrike/falconutil-action@8980108a85f121bda92d8ee15f1b20bb08753d0a # main
+        with:
+          falcon_client_id: ${{ secrets.FALCON_CLIENT_ID }}
+          falcon_region: ${{ env.FALCON_REGION }}
+          cid: ${{ steps.setup.outputs.cid }}
+          source_image_uri: ${{ steps.setup.outputs.source }}
+          target_image_uri: local/patched:test
+          falcon_image_platform: ${{ matrix.platform }}
+          falcon_image_uri: ${{ matrix.falcon_uri }}
+          image_pull_policy: ${{ matrix.policy }}
+        env:
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+
+      - name: Verify
+        env:
+          OUTCOME: ${{ matrix.impl == 'fix' && steps.patch-fix.outcome || steps.patch-main.outcome }}
+          SOURCE: ${{ matrix.source }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          case "$(uname -m)" in x86_64) runner_arch=amd64 ;; aarch64) runner_arch=arm64 ;; esac
+          case "$PLATFORM" in
+            x86_64) target=amd64 ;;
+            aarch64) target=arm64 ;;
+            *) if [[ "$SOURCE" == multi ]]; then target=$runner_arch; else target=$SOURCE; fi ;;
+          esac
+          if [[ "$SOURCE" == multi || "$SOURCE" == "$target" ]]; then expected=success; else expected=failure; fi
+
+          binary=none
+          if [[ -f /opt/crowdstrike/bin/falconutil ]]; then
+            case "$(od -An -tx1 -j18 -N2 /opt/crowdstrike/bin/falconutil | tr -d ' \n')" in
+              3e00) binary=amd64 ;; b700) binary=arm64 ;; *) binary=unknown ;;
+            esac
+          fi
+          patched=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' local/patched:test 2>/dev/null || echo none)
+
+          correct=true
+          [[ "$OUTCOME" == "$expected" ]] || correct=false
+          if [[ "$OUTCOME" == success && "$patched" != "linux/$target" ]]; then correct=false; fi
+
+          line="| ${{ matrix.impl }} | ${runner_arch} | ${SOURCE} | ${PLATFORM:-auto} | ${{ matrix.policy }} | ${{ matrix.falcon }} | expected ${expected} | got ${OUTCOME} | patched ${patched} | falconutil ${binary} | ${correct} |"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$correct" == true ]]
