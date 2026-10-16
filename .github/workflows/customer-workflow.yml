@@ -1,0 +1,222 @@
+# Test-only workflow for the fork. Mimics the customer's "Build, Patch and Push" workflow on
+# GitHub-hosted ubuntu-latest, with Google Artifact Registry replaced by GHCR.
+#   impl:    v1.1.0 (what the customer uses; same action files as main) or pr (PR #17 head)
+#   variant: customer = their workflow as sent (sensor normalization step, falcon_image_uri,
+#            the "cloud-service" typo); plain = the same build without the workaround
+name: customer-workflow
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [test/customer-workflow]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CGO_ENABLED: "1"
+  REGISTRY: ghcr.io/${{ github.repository_owner }}/falconutil-action-customer-test
+
+jobs:
+  build-patch-push:
+    name: ${{ matrix.impl }} ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        impl: [v1.1.0, pr]
+        variant: [customer, plain]
+    env:
+      APP_IMAGE: ghcr.io/${{ github.repository_owner }}/falconutil-action-customer-test:cyber-${{ github.run_id }}-${{ matrix.impl }}-${{ matrix.variant }}
+      PATCHED_IMAGE: ghcr.io/${{ github.repository_owner }}/falconutil-action-customer-test:patched-${{ github.run_id }}-${{ matrix.impl }}-${{ matrix.variant }}
+      NORMALIZED_IMAGE: ghcr.io/${{ github.repository_owner }}/falconutil-action-customer-test:falcon-normalized-${{ github.run_id }}-${{ matrix.impl }}
+
+    steps:
+      - name: Environment Info
+        run: |
+          echo "Image registry = ${REGISTRY}"
+          echo "uname -m: $(uname -m)"
+          echo "ImageOS: ${ImageOS:-} ImageVersion: ${ImageVersion:-}"
+
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify Docker
+        run: |
+          docker --version
+          docker buildx version
+          docker info --format 'Docker architecture: {{.Architecture}}'
+          docker info 2>/dev/null | grep -i -E 'storage driver|driver-type' || true
+
+      - name: Log in to GHCR (stands in for Google Artifact Registry)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Get the CID
+        id: cid
+        env:
+          FALCON_CLIENT_ID: ${{ secrets.FALCON_CLIENT_ID }}
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+        run: |
+          api=https://api.us-2.crowdstrike.com
+          token=$(curl -s -X POST "$api/oauth2/token" -d "client_id=$FALCON_CLIENT_ID" --data-urlencode "client_secret=$FALCON_CLIENT_SECRET" | jq -r .access_token)
+          cid=$(curl -s -H "Authorization: Bearer $token" "$api/sensors/queries/installers/ccid/v1" | jq -r '.resources[0]')
+          echo "::add-mask::$cid"
+          echo "cid=$cid" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .github/customer-test
+          target: cyber
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.APP_IMAGE }}
+
+      - name: Verify source image platform
+        run: docker buildx imagetools inspect "$APP_IMAGE"
+
+      - name: Pull source image locally
+        run: |
+          docker pull --platform linux/amd64 "$APP_IMAGE"
+          docker image inspect "$APP_IMAGE" --format 'OS={{.Os}} ARCH={{.Architecture}} ID={{.Id}}'
+
+      - name: Pull Falcon sensor
+        id: falcon-pull
+        if: matrix.variant == 'customer'
+        shell: bash
+        env:
+          FALCON_CLIENT_ID: ${{ secrets.FALCON_CLIENT_ID }}
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            https://raw.githubusercontent.com/CrowdStrike/falcon-scripts/main/bash/containers/falcon-container-sensor-pull/falcon-container-sensor-pull.sh \
+            -o falcon-container-sensor-pull.sh
+
+          bash falcon-container-sensor-pull.sh \
+            -u "$FALCON_CLIENT_ID" \
+            -s "$FALCON_CLIENT_SECRET" \
+            -r us-2 \
+            -t falcon-container \
+            --platform x86_64
+
+          IMAGE="registry.crowdstrike.com/falcon-container/release/falcon-container"
+
+          TAG=$(docker image ls \
+            --format '{{.Tag}}' \
+            "$IMAGE" \
+            | head -n 1)
+
+          if [[ -z "$TAG" ]]; then
+            echo "::error::Falcon sensor image was not pulled"
+            exit 1
+          fi
+
+          SOURCE_IMAGE="${IMAGE}:${TAG}"
+
+          echo "Resolved Falcon sensor: $SOURCE_IMAGE"
+          echo "falcon_source_image=$SOURCE_IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Normalize Falcon sensor image
+        id: falcon-normalized
+        if: matrix.variant == 'customer'
+        shell: bash
+        env:
+          FALCON_SOURCE_IMAGE: ${{ steps.falcon-pull.outputs.falcon_source_image }}
+        run: |
+          set -euo pipefail
+
+          TARGET_IMAGE="$NORMALIZED_IMAGE"
+
+          echo "Source: $FALCON_SOURCE_IMAGE"
+          echo "Target: $TARGET_IMAGE"
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg FALCON_IMAGE="$FALCON_SOURCE_IMAGE" \
+            --tag "$TARGET_IMAGE" \
+            --push \
+            -f - . <<'DOCKERFILE'
+          ARG FALCON_IMAGE
+          FROM --platform=linux/amd64 ${FALCON_IMAGE}
+          LABEL org.opencontainers.image.description="Derived Falcon sensor image"
+          DOCKERFILE
+
+          docker pull --platform linux/amd64 "$TARGET_IMAGE"
+
+          docker image inspect "$TARGET_IMAGE" \
+            --format 'OS={{.Os}} ARCH={{.Architecture}} ID={{.Id}}'
+
+          echo "falcon_image_uri=$TARGET_IMAGE" >> "$GITHUB_OUTPUT"
+
+      # uses: can't be an expression, so there is one step per implementation.
+      # The customer variant keeps their "cloud-service" input as sent; plain uses cloud_service.
+      - name: Patch image with Falcon (v1.1.0)
+        id: patch-v110
+        if: matrix.impl == 'v1.1.0'
+        continue-on-error: true
+        uses: crowdstrike/falconutil-action@v1.1.0
+        with:
+          falcon_client_id: ${{ secrets.FALCON_CLIENT_ID }}
+          falcon_region: us-2
+          source_image_uri: ${{ env.APP_IMAGE }}
+          target_image_uri: ${{ env.PATCHED_IMAGE }}
+          falcon_image_uri: ${{ steps.falcon-normalized.outputs.falcon_image_uri }}
+          cid: ${{ steps.cid.outputs.cid }}
+          falcon_image_platform: x86_64
+          image_pull_policy: IfNotPresent
+          cloud-service: CLOUDRUN
+          cloud_service: ${{ matrix.variant == 'plain' && 'CLOUDRUN' || '' }}
+        env:
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+
+      - name: Patch image with Falcon (PR 17)
+        id: patch-pr
+        if: matrix.impl == 'pr'
+        continue-on-error: true
+        uses: crowdstrike/falconutil-action@ea677c6d981ed28e4ce496584ec77c57f04cb3be # fix/multi-arch-platform
+        with:
+          falcon_client_id: ${{ secrets.FALCON_CLIENT_ID }}
+          falcon_region: us-2
+          source_image_uri: ${{ env.APP_IMAGE }}
+          target_image_uri: ${{ env.PATCHED_IMAGE }}
+          falcon_image_uri: ${{ steps.falcon-normalized.outputs.falcon_image_uri }}
+          cid: ${{ steps.cid.outputs.cid }}
+          falcon_image_platform: x86_64
+          image_pull_policy: IfNotPresent
+          cloud-service: CLOUDRUN
+          cloud_service: ${{ matrix.variant == 'plain' && 'CLOUDRUN' || '' }}
+        env:
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+
+      - name: Verify patched image
+        id: verify
+        env:
+          OUTCOME: ${{ matrix.impl == 'pr' && steps.patch-pr.outcome || steps.patch-v110.outcome }}
+        run: |
+          patched=$(docker image inspect "$PATCHED_IMAGE" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || echo none)
+          entrypoint=$(docker image inspect "$PATCHED_IMAGE" --format '{{json .Config.Entrypoint}}' 2>/dev/null || echo none)
+          cloud=$(docker image inspect "$PATCHED_IMAGE" --format '{{json .Config.Env}}' 2>/dev/null | grep -o -i 'cloud[^",]*' | head -n 3 | tr '\n' ' ')
+          echo "patch outcome: $OUTCOME"
+          echo "patched image: $patched"
+          echo "entrypoint:    $entrypoint"
+          echo "cloud env:     ${cloud:-none}"
+          echo "| ${{ matrix.impl }} | ${{ matrix.variant }} | $(uname -m) | $OUTCOME | $patched | ${cloud:-none} |" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$OUTCOME" == success && "$patched" == linux/amd64 ]]
+
+      - name: Push Patched Image
+        run: docker push "$PATCHED_IMAGE"
+
+      - name: Verify patched image platform
+        run: docker buildx imagetools inspect "$PATCHED_IMAGE"

@@ -1,0 +1,17 @@
+# Test-only probe: does github.com accept the customer's job-level "container" block,
+# which has options but no image? Kept separate so a rejected file can't block the main test.
+name: customer-container-probe
+
+on:
+  push:
+    branches: [test/customer-workflow]
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    container:
+      options: --cpus 8 --memory 8g
+    steps:
+      - run: |
+          echo "uname -m: $(uname -m)"
+          cat /etc/os-release | head -2
