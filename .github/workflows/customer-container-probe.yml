@@ -1,5 +1,6 @@
-# Test-only probe: does github.com accept the customer's job-level "container" block,
-# which has options but no image? Kept separate so a rejected file can't block the main test.
+# Test-only probe: the customer's job-level container options on GitHub-hosted ubuntu-latest,
+# with the image they most likely use. Kept separate so a container that can't start doesn't
+# block the main test.
 name: customer-container-probe
 
 on:
@@ -10,8 +11,10 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     container:
+      image: catthehacker/ubuntu:act-latest
       options: --cpus 8 --memory 8g
     steps:
       - run: |
           echo "uname -m: $(uname -m)"
-          cat /etc/os-release | head -2
+          echo "nproc: $(nproc)"
+          docker info --format 'Docker architecture: {{.Architecture}} CPUs: {{.NCPU}}'

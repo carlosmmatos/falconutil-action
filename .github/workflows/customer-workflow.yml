@@ -20,8 +20,13 @@ env:
 
 jobs:
   build-patch-push:
-    name: ${{ matrix.impl }} ${{ matrix.variant }}
+    name: ${{ matrix.impl }} ${{ matrix.variant }} (container)
     runs-on: ubuntu-latest
+    # The customer's file has a container block without an image; assume the image that
+    # act and Gitea/Forgejo runners commonly use for ubuntu-latest. Their --cpus/--memory
+    # options are tested separately in customer-container-probe.yml.
+    container:
+      image: catthehacker/ubuntu:act-latest
     strategy:
       fail-fast: false
       matrix:
