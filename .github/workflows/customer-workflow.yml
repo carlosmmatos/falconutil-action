@@ -216,7 +216,7 @@ jobs:
         run: |
           patched=$(docker image inspect "$PATCHED_IMAGE" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || echo none)
           entrypoint=$(docker image inspect "$PATCHED_IMAGE" --format '{{json .Config.Entrypoint}}' 2>/dev/null || echo none)
-          cloud=$(docker image inspect "$PATCHED_IMAGE" --format '{{json .Config.Env}}' 2>/dev/null | grep -o -i 'cloud[^",]*' | head -n 3 | tr '\n' ' ')
+          cloud=$(docker image inspect "$PATCHED_IMAGE" --format '{{json .Config.Env}}' 2>/dev/null | grep -o -i 'cloud[^",]*' | head -n 3 | tr '\n' ' ' || true)
           echo "patch outcome: $OUTCOME"
           echo "patched image: $patched"
           echo "entrypoint:    $entrypoint"
