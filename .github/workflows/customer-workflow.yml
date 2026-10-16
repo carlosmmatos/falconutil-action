@@ -27,6 +27,10 @@ jobs:
     # options are tested separately in customer-container-probe.yml.
     container:
       image: catthehacker/ubuntu:act-latest
+    # In a job container the default shell is sh, not bash
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
