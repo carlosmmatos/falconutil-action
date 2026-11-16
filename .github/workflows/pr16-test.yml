@@ -1,0 +1,19 @@
+name: PR16 retry test
+on:
+  push:
+    branches: [test/pr-16-retry]
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker run -d -p 5000:5000 registry:2 && docker pull nginx:latest
+      - uses: ./
+        with:
+          falcon_client_id: ${{ secrets.FALCON_CLIENT_ID }}
+          falcon_region: us-2
+          source_image_uri: nginx:latest
+          target_image_uri: localhost:5000/nginx:patched
+        env:
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+      - run: docker image inspect localhost:5000/nginx:patched --format '{{.Id}}'
